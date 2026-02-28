@@ -144,9 +144,25 @@ class Detect(nn.Module):
         return dict(boxes=boxes, scores=scores, feats=x)
 
     def forward(
-        self, x: list[torch.Tensor]
+        self, x: list[torch.Tensor], task_type: str = "Detect"
     ) -> dict[str, torch.Tensor] | torch.Tensor | tuple[torch.Tensor, dict[str, torch.Tensor]]:
         """Concatenates and returns predicted bounding boxes and class probabilities."""
+        if task_type in ['Pose', 'Obb']:
+            y = []
+            for i in range(self.nl):
+                y.append(torch.cat((self.cv2[i](x[i]), self.cv3[i](x[i])), 1))
+            return y       
+
+        if self.export and self.format == 'rknn_pure':
+            y = []
+            for i in range(self.nl):
+                y.append(self.cv2[i](x[i]))
+                cls = torch.sigmoid(self.cv3[i](x[i]))
+                cls_sum = torch.clamp(cls.sum(1, keepdim=True), 0, 1)
+                y.append(cls)
+                y.append(cls_sum)
+            return y               
+        
         preds = self.forward_head(x, **self.one2many)
         if self.end2end:
             x_detach = [xi.detach() for xi in x]
@@ -305,6 +321,14 @@ class Segment(Detect):
 
     def forward(self, x: list[torch.Tensor]) -> tuple | list[torch.Tensor] | dict[str, torch.Tensor]:
         """Return model outputs and mask coefficients if training, otherwise return outputs and mask coefficients."""
+
+        p = self.proto(x[0])  # mask protos
+        bs = p.shape[0]  # batch size
+        if self.export and self.format == 'rknn_pure':
+            mc = [self.cv4[i](x[i]) for i in range(self.nl)]
+        else:
+            mc = torch.cat([self.cv4[i](x[i]).view(bs, self.nm, -1) for i in range(self.nl)], 2)  # mask coefficients
+
         outputs = super().forward(x)
         preds = outputs[1] if isinstance(outputs, tuple) else outputs
         proto = self.proto(x[0])  # mask protos
@@ -316,6 +340,14 @@ class Segment(Detect):
                 preds["proto"] = proto
         if self.training:
             return preds
+        if self.export and self.format == 'rknn_pure':
+            bo = len(x)//3
+            relocated = []
+            for i in range(len(mc)):
+                relocated.extend(x[i*bo:(i+1)*bo])
+                relocated.extend([mc[i]])
+            relocated.extend([p])
+            return relocated
         return (outputs, proto) if self.export else ((outputs[0], proto), preds)
 
     def _inference(self, x: dict[str, torch.Tensor]) -> torch.Tensor:
@@ -392,6 +424,13 @@ class Segment26(Segment):
 
     def forward(self, x: list[torch.Tensor]) -> tuple | list[torch.Tensor] | dict[str, torch.Tensor]:
         """Return model outputs and mask coefficients if training, otherwise return outputs and mask coefficients."""
+        p = self.proto(x[0])  # mask protos
+        bs = p.shape[0]  # batch size
+        if self.export and self.format == 'rknn_pure':
+            mc = [self.cv4[i](x[i]) for i in range(self.nl)]
+        else:
+            mc = torch.cat([self.cv4[i](x[i]).view(bs, self.nm, -1) for i in range(self.nl)], 2)  # mask coefficients
+
         outputs = Detect.forward(self, x)
         preds = outputs[1] if isinstance(outputs, tuple) else outputs
         proto = self.proto(x)  # mask protos
@@ -405,6 +444,14 @@ class Segment26(Segment):
                 preds["proto"] = proto
         if self.training:
             return preds
+        if self.export and self.format == 'rknn_pure':
+            bo = len(x)//3
+            relocated = []
+            for i in range(len(mc)):
+                relocated.extend(x[i*bo:(i+1)*bo])
+                relocated.extend([mc[i]])
+            relocated.extend([p])
+            return relocated
         return (outputs, proto) if self.export else ((outputs[0], proto), preds)
 
     def fuse(self) -> None:
@@ -474,6 +521,13 @@ class OBB(Detect):
         self, x: list[torch.Tensor], box_head: torch.nn.Module, cls_head: torch.nn.Module, angle_head: torch.nn.Module
     ) -> dict[str, torch.Tensor]:
         """Concatenates and returns predicted bounding boxes, class probabilities, and angles."""
+        bs = x[0].shape[0]  # batch size
+        angle = torch.cat([self.cv4[i](x[i]).view(bs, self.ne, -1) for i in range(self.nl)], 2)  # OBB theta logits
+
+        if self.export and self.format == 'rknn_pure':
+            x = Detect.forward(self, x, "Obb")
+            return [x, angle.sigmoid()]
+        
         preds = super().forward_head(x, box_head, cls_head)
         if angle_head is not None:
             bs = x[0].shape[0]  # batch size
@@ -534,6 +588,13 @@ class OBB26(OBB):
         self, x: list[torch.Tensor], box_head: torch.nn.Module, cls_head: torch.nn.Module, angle_head: torch.nn.Module
     ) -> dict[str, torch.Tensor]:
         """Concatenates and returns predicted bounding boxes, class probabilities, and raw angles."""
+        bs = x[0].shape[0]  # batch size
+        angle = torch.cat([self.cv4[i](x[i]).view(bs, self.ne, -1) for i in range(self.nl)], 2)  # OBB theta logits
+
+        if self.export and self.format == 'rknn_pure':
+            x = Detect.forward(self, x, "Obb")
+            return [x, angle.sigmoid()]
+        
         preds = Detect.forward_head(self, x, box_head, cls_head)
         if angle_head is not None:
             bs = x[0].shape[0]  # batch size
@@ -603,6 +664,22 @@ class Pose(Detect):
         self, x: list[torch.Tensor], box_head: torch.nn.Module, cls_head: torch.nn.Module, pose_head: torch.nn.Module
     ) -> dict[str, torch.Tensor]:
         """Concatenates and returns predicted bounding boxes, class probabilities, and keypoints."""
+        bs = x[0].shape[0]  # batch size
+        kpt = torch.cat([self.cv4[i](x[i]).view(bs, self.nk, -1) for i in range(self.nl)], -1)  # (bs, 17*3, h*w)
+
+        if self.export and self.format == 'rknn_pure':
+            output_x = Detect.forward(self, x, 'Pose')
+            y = []
+            y.append(output_x)
+            self.export = False
+            x = Detect.forward(self, x)
+            self.export = True
+            pred_kpt = self.kpts_decode(bs, kpt)
+            y.append(pred_kpt)
+            return y
+        # else:
+            # x = Detect.forward(self, x)
+
         preds = super().forward_head(x, box_head, cls_head)
         if pose_head is not None:
             bs = x[0].shape[0]  # batch size
@@ -639,6 +716,8 @@ class Pose(Detect):
             a = (y[:, :, :2] * 2.0 + (self.anchors - 0.5)) * self.strides
             if ndim == 3:
                 a = torch.cat((a, y[:, :, 2:3].sigmoid()), 2)
+            if self.export and self.format == 'rknn_pure':
+                return a
             return a.view(bs, self.nk, -1)
         else:
             y = kpts.clone()

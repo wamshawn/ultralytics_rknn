@@ -196,6 +196,7 @@ class AutoBackend(nn.Module):
             pte,
             axelera,
             triton,
+            rknn_pure,
         ) = self._model_type("" if nn_module else model)
         fp16 &= pt or jit or onnx or xml or engine or nn_module or triton  # FP16
         nhwc = coreml or saved_model or pb or tflite or edgetpu or rknn  # BHWC formats (vs torch BCHW)
@@ -854,6 +855,10 @@ class AutoBackend(nn.Module):
             im = (im.cpu().numpy() * 255).astype("uint8")
             im = im if isinstance(im, (list, tuple)) else [im]
             y = self.rknn_model.inference(inputs=im)
+        
+        # RKNN PURE
+        elif getattr(self, 'rknn_pure', False):
+            assert "for inference, please refer to https://github.com/airockchip/rknn_model_zoo/"
 
         # Axelera
         elif self.axelera:

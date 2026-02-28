@@ -179,6 +179,7 @@ def export_formats():
         ["RKNN", "rknn", "_rknn_model", False, False, ["batch", "name"]],
         ["ExecuTorch", "executorch", "_executorch_model", True, False, ["batch"]],
         ["Axelera", "axelera", "_axelera_model", False, False, ["batch", "int8", "fraction"]],
+        ['RKNN Pure', 'rknn_pure', '_rknnopt.torchscript', True, False, ["batch", "dynamic", "half", "opset", "simplify", "nms"]],
     ]
     return dict(zip(["Format", "Argument", "Suffix", "CPU", "GPU", "Arguments"], zip(*x)))
 
@@ -365,10 +366,11 @@ class Exporter:
             rknn,
             executorch,
             axelera,
+            rknn_pure,
         ) = flags  # export booleans
 
         is_tf_format = any((saved_model, pb, tflite, edgetpu, tfjs))
-
+        
         # Device
         dla = None
         if engine and self.args.device is None:
@@ -616,6 +618,8 @@ class Exporter:
             f[15] = self.export_executorch()
         if axelera:
             f[16] = self.export_axelera()
+        if rknn_pure:
+            f[17] = self.export_rknn_pure()
 
         # Finish
         f = [str(x) for x in f if x]  # filter out '' and None
@@ -1275,6 +1279,35 @@ class Exporter:
         rknn.export_rknn(f"{export_path / f}")
         YAML.save(export_path / "metadata.yaml", self.metadata)
         return export_path
+    
+    @try_export
+    def export_rknn_pure(self, prefix=colorstr('RKNN:')):
+        """YOLOv8 RKNN model export."""
+        LOGGER.info(f'\n{prefix} starting export with torch {torch.__version__}...')
+
+        # ts = torch.jit.trace(self.model, self.im, strict=False)
+        # f = str(self.file).replace(self.file.suffix, f'_rknnopt.torchscript')
+        # torch.jit.save(ts, str(f))
+
+        f = str(self.file).replace(self.file.suffix, f'.onnx')
+        import onnx
+
+        opset_version = self.args.opset or best_onnx_opset(onnx, cuda="cuda" in self.device.type)
+        if opset_version > 17:
+            opset_version = 17
+
+        torch.onnx.export(
+            self.model,
+            self.im[0:1,:,:,:],
+            f,
+            verbose=False,
+            opset_version=opset_version,
+            do_constant_folding=True,  # WARNING: DNN inference with torch>=1.12 may require do_constant_folding=False
+            input_names=['images'])
+
+        LOGGER.info(f'\n{prefix} feed {f} to RKNN-Toolkit or RKNN-Toolkit2 to generate RKNN model.\n' 
+                    'Refer https://github.com/airockchip/rknn_model_zoo/tree/main/examples/')
+        return f
 
     @try_export
     def export_imx(self, prefix=colorstr("IMX:")):
@@ -1570,3 +1603,20 @@ class NMSModel(torch.nn.Module):
             pad = (0, 0, 0, self.args.max_det - dets.shape[0])
             out[i] = torch.nn.functional.pad(dets, pad)
         return (out[:bs], preds[1]) if self.model.task == "segment" else out[:bs]
+
+
+
+def export(cfg=DEFAULT_CFG):
+    """Export a YOLO model to a specific format."""
+    cfg.model = cfg.model or 'yolo26n.yaml'
+    cfg.format = cfg.format or 'torchscript'
+    from ultralytics import YOLO
+    model = YOLO(cfg.model)
+    model.export(**vars(cfg))
+
+if __name__ == '__main__':
+    """
+    CLI:
+    yolo mode=export model=yolo26n.yaml format=onnx
+    """
+    export()
